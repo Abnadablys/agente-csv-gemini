@@ -17,10 +17,18 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 # Carrega .env
 load_dotenv()
 
-# Config API Gemini
-API_KEY = os.getenv('GOOGLE_API_KEY')
+# --- Configuração da API Gemini (funciona local + online) ---
+if "GOOGLE_API_KEY" in st.secrets:
+    API_KEY = st.secrets["GOOGLE_API_KEY"]
+else:
+    from dotenv import load_dotenv
+    load_dotenv()
+    API_KEY = os.getenv("GOOGLE_API_KEY")
+
 if not API_KEY:
-    st.error("❌ Chave API do Gemini não encontrada no .env. Adicione GOOGLE_API_KEY=...")
+    st.error("❌ Chave API do Gemini não encontrada. Adicione em Settings → Secrets (ou .env local).")
+else:
+    os.environ["GOOGLE_API_KEY"] = API_KEY  # Necessário para o LangChain/Google funcionar
 
 # Função aproximadora de tokens (1 token ≈ 4 chars)
 def estimate_tokens(text: str) -> int:

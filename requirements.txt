@@ -4,3 +4,4 @@ langchain_google_genai
 pandas
 plotly
 python-dotenv
+google-generativeai
