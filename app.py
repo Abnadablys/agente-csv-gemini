@@ -11,29 +11,63 @@ from dotenv import load_dotenv
 import os
 import random
 
-# Suprime logs chatos do Google/TensorFlow
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
-# Carrega .env
 load_dotenv()
 
-# --- Configuração da API Gemini (funciona local + online) ---
-if "GOOGLE_API_KEY" in st.secrets:
-    API_KEY = st.secrets["GOOGLE_API_KEY"]
-else:
-    from dotenv import load_dotenv
-    load_dotenv()
-    API_KEY = os.getenv("GOOGLE_API_KEY")
+# --- Configuração da API ---
+try:
+    if "GOOGLE_API_KEY" in st.secrets:
+        API_KEY = st.secrets["GOOGLE_API_KEY"]
+        print("Using st.secrets (cloud)")
+except Exception as e:
+    print(f"st.secrets not available locally: {e} - using .env")
+
+if 'API_KEY' not in locals():
+    API_KEY = os.getenv('GOOGLE_API_KEY')
 
 if not API_KEY:
-    st.error("❌ Chave API do Gemini não encontrada. Adicione em Settings → Secrets (ou .env local).")
+    st.error("❌ Chave API do Gemini não encontrada. Adicione GOOGLE_API_KEY no .env ou Secrets.")
+    st.stop()
 else:
-    os.environ["GOOGLE_API_KEY"] = API_KEY  # Necessário para o LangChain/Google funcionar
+    os.environ["GOOGLE_API_KEY"] = API_KEY
 
-# Função aproximadora de tokens (1 token ≈ 4 chars)
+
 def estimate_tokens(text: str) -> int:
-    return len(text) // 4 + 1  # Aproximação conservadora
+    return len(text) // 4 + 1
 
+
+# --------------------------------------------------------
+# 🔍 Função leve para decidir o tipo de gráfico
+# --------------------------------------------------------
+def choose_chart_type(df: pd.DataFrame, question: str) -> str:
+    q = question.lower()
+    num_cols = df.select_dtypes(include='number').columns.tolist()
+    cat_cols = df.select_dtypes(exclude='number').columns.tolist()
+
+    if 'tendência' in q or 'evolução' in q or 'tempo' in q or 'linha' in q:
+        return 'line'
+    elif 'proporção' in q or 'porcentagem' in q or 'pizza' in q:
+        return 'pie'
+    elif 'comparação' in q or 'ranking' in q or 'maior' in q or 'barras' in q:
+        return 'bar'
+    elif 'relação' in q or 'correlação' in q or 'dispersão' in q or 'scatter' in q:
+        return 'scatter'
+    elif 'variabilidade' in q or 'distribuição' in q or 'box' in q:
+        return 'box'
+    elif 'heatmap' in q or 'matriz' in q:
+        return 'heatmap'
+    else:
+        if len(cat_cols) and len(num_cols):
+            return 'bar'
+        elif len(num_cols) > 1:
+            return 'scatter'
+        else:
+            return 'histogram'
+
+
+# --------------------------------------------------------
+# 🧠 Classe principal do agente Gemini
+# --------------------------------------------------------
 class AgenteGeminiCSV:
     def __init__(self, model_name: str = "gemini-2.5-flash"):
         self.df = None
@@ -42,28 +76,26 @@ class AgenteGeminiCSV:
         self.prompt_template = PromptTemplate(
             input_variables=["data_summary", "sample_data", "history", "question"],
             template="""
-            Você é um agente analista de dados. Responda a pergunta sobre o CSV, calculando tudo necessário (médias, medianas, desvios, outliers, correlações, etc.) baseado no resumo full e amostra. Use os dados exatos fornecidos.
+            Você é um analista de dados. Responda à pergunta sobre o CSV com base no resumo e na amostra.
+            Calcule médias, medianas, desvios, outliers, correlações e o que for necessário.
 
-            Resumo completo (calcule com mean= média, 50%=mediana, std=desvio padrão, min/max pra outliers): {data_summary}
-            Amostra relevante (use pra verificação): {sample_data}
+            Resumo: {data_summary}
+            Amostra: {sample_data}
             Histórico recente: {history}
-
             Pergunta: {question}
 
-            Instruções:
-            - Calcule e responda exato (ex.: 'Média de Amount: 240.90; Mediana: 122.21').
-            - Seja breve: 2-4 frases.
-            - Sugira APENAS UM gráfico específico.
-            - Finalize com 2-3 conclusões chave.
+            - Seja direto e técnico (2-4 frases).
+            - Só sugira gráfico se for realmente útil (ex.: "Um gráfico de barras ajudaria a visualizar isso.").
+            - Caso contrário, apenas responda.
+            - Termine com 2 conclusões breves.
             """
         )
         self.chain = self.prompt_template | self.llm
 
     def load_csv(self, uploaded_file):
-        """Carrega CSV do upload."""
         try:
             self.df = pd.read_csv(uploaded_file)
-            self.memory = []  # Limpa ao novo upload
+            self.memory = []
             st.success(f"✅ CSV carregado: {len(self.df)} linhas, colunas: {list(self.df.columns)}")
             return True
         except Exception as e:
@@ -74,21 +106,13 @@ class AgenteGeminiCSV:
         if self.df is None:
             return "Sem dados."
         summary = f"Linhas: {len(self.df)}\nColunas: {len(self.df.columns)}\nTipos: {dict(self.df.dtypes)}\n"
-        
-        # Resumo full sem truncagem (Gemini aguenta; ~1k tokens max)
         num_cols = self.df.select_dtypes(include=['number']).columns
         if len(num_cols) > 0:
             full_stats = self.df[num_cols].describe().round(2)
-            summary += f"Stats full numéricas:\n{full_stats.to_string()}\n"
-        
-        cat_cols = self.df.select_dtypes(include=['object', 'category']).columns
-        for col in cat_cols:
-            vc = self.df[col].value_counts().to_dict()  # Full value_counts
-            summary += f"{col} frequências full: {vc}\n"
-        
+            summary += f"Stats numéricas:\n{full_stats.to_string()}\n"
         return summary
 
-    def get_relevant_sample(self, question: str, sample_size: int = 20) -> str:  # Maior amostra pra mais dados
+    def get_relevant_sample(self, question: str, sample_size: int = 15) -> str:
         if self.df is None:
             return "Sem dados."
         keywords = re.findall(r'\w+', question.lower())
@@ -99,153 +123,91 @@ class AgenteGeminiCSV:
             if mask.any():
                 sample_df = sample_df[mask]
         if len(sample_df) == 0 or len(sample_df) > sample_size * 2:
-            sample_df = self.df.sample(n=min(sample_size * 2, len(self.df)))
-            num_cols = self.df.select_dtypes(include=['number']).columns
-            if len(num_cols) > 0:
-                sample_df = sample_df.sort_values(num_cols[0], ascending=False).head(sample_size)
-        return f"Amostra ({len(sample_df)} linhas):\n{sample_df.head(sample_size).to_string(index=False)}"  # Sem truncagem
-
-    def suggest_and_generate_graph(self, question: str, answer: str) -> Tuple[str, go.Figure]:
-        """Gera gráfico variado baseado na pergunta + texto da resposta."""
-        q_lower = question.lower()
-        answer_lower = answer.lower()
-
-        # Parser melhor: Extrai sugestão completa
-        suggestion = ""
-        graph_match = re.search(r"sugira\s+um\s+gráfico\s+de\s+['\"]([^'\"]+)['\"]", answer_lower) or \
-                      re.search(r"gráfico\s+de\s+(['\"]([^'\"]+)['\"])", answer_lower)
-        if graph_match:
-            suggestion = graph_match.group(1) or graph_match.group(2)
-        else:
-            # Fallback: Usa keywords da pergunta
-            if 'pizza' in q_lower or 'proporção' in q_lower:
-                suggestion = "gráfico de pizza de Class"
-            elif 'scatter' in q_lower or 'relação' in q_lower:
-                suggestion = "scatter de V1 vs V2 por Class"
-            elif 'barras' in q_lower or 'contagem' in q_lower:
-                suggestion = "gráfico de barras de Class"
-            elif 'box' in q_lower or 'variabilidade' in q_lower:
-                suggestion = "boxplot de Amount por Class"
-            elif 'linha' in q_lower or 'tendência' in q_lower:
-                suggestion = "gráfico de linhas de Amount por Time"
-            elif 'heatmap' in q_lower or 'correlações' in q_lower:
-                suggestion = "heatmap de correlações V1-V3"
-            else:
-                suggestion = "histograma de Amount"
-
-        suggest_lower = suggestion.lower()
-
-        # Cases explícitos com variação
-        num_cols = self.df.select_dtypes(include=['number']).columns.tolist()
-        cat_cols = self.df.select_dtypes(include=['object', 'category']).columns.tolist() or ['Class']
-
-        if 'pizza' in suggest_lower or 'proporção' in suggest_lower:
-            labels = self.df[cat_cols[0]].value_counts().index
-            values = self.df[cat_cols[0]].value_counts().values
-            fig = px.pie(values=values, names=labels, title=f"Proporção de {cat_cols[0]}")
-        elif 'barras' in suggest_lower or 'contagem' in suggest_lower or 'frequentes' in suggest_lower:
-            col = 'Class' if 'class' in suggest_lower else cat_cols[0]
-            counts = self.df[col].value_counts()
-            fig = px.bar(x=counts.index, y=counts.values, title=f"Contagem de {col}")
-        elif 'box' in suggest_lower or 'variabilidade' in suggest_lower:
-            y_col = 'Amount' if 'amount' in suggest_lower else num_cols[0]
-            x_col = 'Class' if 'class' in suggest_lower else None
-            if x_col:
-                fig = px.box(self.df, x=x_col, y=y_col, title=f"Boxplot de {y_col} por {x_col}")
-            else:
-                fig = px.box(self.df, y=y_col, title=f"Boxplot de {y_col}")
-        elif 'scatter' in suggest_lower or 'dispersão' in suggest_lower or 'relação' in suggest_lower or 'correlação' in suggest_lower:
-            x_candidates = ['V1', 'V2', 'V3', 'Time']
-            y_candidates = ['Amount', 'V10', 'V20']
-            x_col = next((c for c in x_candidates if c in suggest_lower), random.choice(x_candidates))
-            y_col = next((c for c in y_candidates if c in suggest_lower), random.choice(y_candidates))
-            color_col = 'Class' if 'class' in suggest_lower else None
-            fig = px.scatter(self.df, x=x_col, y=y_col, color=color_col, title=f"Scatter {x_col} vs {y_col}" + (f" por {color_col}" if color_col else ""))
-        elif 'linha' in suggest_lower or 'tendência' in suggest_lower or 'time' in suggest_lower:
-            x_col = 'Time' if 'time' in suggest_lower else num_cols[0]
-            y_col = 'Amount' if 'amount' in suggest_lower else num_cols[1 % len(num_cols)]
-            df_sorted = self.df.sort_values(x_col)
-            fig = px.line(df_sorted, x=x_col, y=y_col, title=f"Tendência de {y_col} por {x_col}")
-        elif 'heatmap' in suggest_lower or 'correlações' in suggest_lower or 'cruzada' in suggest_lower:
-            if 'cruzada' in suggest_lower:
-                crosstab = pd.crosstab(self.df['Class'], pd.cut(self.df['Amount'], bins=5))
-                fig = px.imshow(crosstab, title="Heatmap de Tabela Cruzada (Class vs Intervalos de Amount)")
-            else:
-                top_cols = num_cols[:4]
-                corr = self.df[top_cols].corr()
-                fig = px.imshow(corr, title="Heatmap de Correlações")
-        elif 'violino' in suggest_lower or 'densidade' in suggest_lower:
-            y_col = 'Amount' if 'amount' in suggest_lower else num_cols[0]
-            x_col = 'Class' if 'class' in suggest_lower else None
-            if x_col:
-                fig = px.violin(self.df, x=x_col, y=y_col, title=f"Violin de {y_col} por {x_col}")
-            else:
-                fig = px.violin(self.df, y=y_col, title=f"Violin de {y_col}")
-        else:
-            # Default variado
-            random.seed(hash(question) % 100)
-            graph_types = ['histograma', 'bar', 'scatter']
-            type_choice = random.choice(graph_types)
-            if type_choice == 'histograma':
-                col = random.choice(num_cols)
-                fig = px.histogram(self.df, x=col, title=f"Histograma de {col}")
-            elif type_choice == 'bar':
-                top_df = self.df.nlargest(10, 'Amount')[['Time', 'Amount', 'Class']]
-                fig = px.bar(top_df, x='Time', y='Amount', color='Class', title="Top 10 Amounts por Class")
-            else:
-                cols = random.sample(num_cols, 2)
-                fig = px.scatter(self.df, x=cols[0], y=cols[1], title=f"Scatter {cols[0]} vs {cols[1]}")
-
-        return suggestion, fig
+            sample_df = self.df.sample(n=min(sample_size, len(self.df)))
+        return f"Amostra ({len(sample_df)} linhas):\n{sample_df.head(sample_size).to_string(index=False)}"
 
     def answer_question(self, question: str) -> str:
         if self.df is None:
             return "Nenhum CSV carregado."
-        
-        # Full pro Gemini: Envia tudo, calcula lá
         summary = self.get_data_summary()
         sample = self.get_relevant_sample(question)
         history = "\n".join([f"P: {h['pergunta']}\nR: {h['resposta'][:100]}..." for h in self.memory[-2:]])
 
         try:
-            # Prompt full
             full_prompt = self.prompt_template.format(
-                data_summary=summary,
-                sample_data=sample,
-                history=history,
-                question=question
+                data_summary=summary, sample_data=sample, history=history, question=question
             )
-            
-            # Estima tokens input
             input_tokens = estimate_tokens(full_prompt)
-            
-            # Chama Gemini
             result = self.llm.invoke(full_prompt)
-            answer = result.content.strip()  # Gemini retorna content
-            
-            # Estima tokens output
+            answer = result.content.strip()
             output_tokens = estimate_tokens(answer)
             total_tokens = input_tokens + output_tokens
-            
-            # Log no Streamlit sidebar pra você ver
-            with st.sidebar.expander("📊 Token Usage (Aproximado)"):
+
+            with st.sidebar.expander("📊 Tokens (estimado)"):
                 st.metric("Input Tokens", input_tokens)
                 st.metric("Output Tokens", output_tokens)
                 st.metric("Total Tokens", total_tokens)
-            
+
             self.memory.append({"pergunta": question, "resposta": answer})
-            time.sleep(2)
+            time.sleep(1)
             return answer
         except Exception as e:
             return f"Erro: {e}"
 
-# Interface Streamlit
+    def generate_graph(self, question: str, chart_type: str) -> go.Figure:
+        num_cols = self.df.select_dtypes(include=['number']).columns.tolist()
+        cat_cols = self.df.select_dtypes(exclude='number').columns.tolist() or ['Class']
+
+        if not num_cols:
+            st.warning("Nenhuma coluna numérica para gráfico.")
+            return None
+
+        if chart_type == 'pie':
+            labels = self.df[cat_cols[0]].value_counts().index
+            values = self.df[cat_cols[0]].value_counts().values
+            fig = px.pie(values=values, names=labels, title=f"Proporção de {cat_cols[0]}")
+
+        elif chart_type == 'bar':
+            col = cat_cols[0]
+            counts = self.df[col].value_counts().head(10)
+            fig = px.bar(x=counts.index, y=counts.values, title=f"Top 10 de {col}")
+
+        elif chart_type == 'scatter':
+            if len(num_cols) < 2:
+                return None
+            fig = px.scatter(self.df.sample(min(1000, len(self.df))), x=num_cols[0], y=num_cols[1],
+                             title=f"Dispersão {num_cols[0]} vs {num_cols[1]}")
+
+        elif chart_type == 'box':
+            y_col = num_cols[0]
+            x_col = cat_cols[0] if cat_cols else None
+            fig = px.box(self.df, x=x_col, y=y_col, title=f"Boxplot de {y_col} por {x_col}" if x_col else f"Boxplot de {y_col}")
+
+        elif chart_type == 'line':
+            if 'Time' in self.df.columns:
+                df_sorted = self.df.sort_values('Time').head(5000)
+                fig = px.line(df_sorted, x='Time', y=num_cols[0], title=f"Tendência de {num_cols[0]} por Time")
+            else:
+                fig = px.line(self.df.head(5000), y=num_cols[0], title=f"Tendência de {num_cols[0]}")
+
+        elif chart_type == 'heatmap':
+            top_cols = num_cols[:4]
+            corr = self.df[top_cols].corr()
+            fig = px.imshow(corr, title="Heatmap de Correlações")
+
+        else:
+            fig = px.histogram(self.df, x=num_cols[0], title=f"Distribuição de {num_cols[0]}")
+
+        return fig
+
+
+# --------------------------------------------------------
+# 🎛️ Interface Streamlit
+# --------------------------------------------------------
 def main():
     st.set_page_config(page_title="Agente CSV com Gemini", layout="wide")
     st.title("🚀 Agente Analista de CSV com Gemini 2.5 Flash")
-    st.markdown("Upload um CSV, faça perguntas e veja respostas + gráficos + tokens usados!")
 
-    # Sidebar
     with st.sidebar:
         st.header("📁 Upload CSV")
         uploaded_file = st.file_uploader("Escolha um arquivo CSV", type="csv")
@@ -256,27 +218,23 @@ def main():
                 st.subheader("Resumo Rápido")
                 st.text(agente.get_data_summary()[:400] + "...")
 
-    # Chat
     if 'agente' not in st.session_state:
         st.session_state.agente = None
     if 'messages' not in st.session_state:
         st.session_state.messages = []
 
-    # Render histórico seguro
     for i, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-            if message.get("fig") and hasattr(message["fig"], 'to_dict'):
-                st.plotly_chart(message["fig"], use_container_width=True, key=f"hist_graph_{i}")
-            elif message.get("fig"):
-                st.warning("Gráfico inválido – ignorando.")
+            if message.get("fig"):
+                st.plotly_chart(message["fig"], use_container_width=True, key=f"graph_{i}")
 
     if st.session_state.agente is None and uploaded_file is not None:
         st.session_state.agente = agente
 
     if prompt := st.chat_input("Faça uma pergunta sobre o CSV..."):
         if st.session_state.agente is None:
-            st.warning("Upload um CSV primeiro!")
+            st.warning("Faça o upload de um CSV primeiro.")
         else:
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
@@ -285,17 +243,27 @@ def main():
             with st.chat_message("assistant"):
                 with st.spinner("Analisando com Gemini..."):
                     answer = st.session_state.agente.answer_question(prompt)
-                    suggestion, fig = st.session_state.agente.suggest_and_generate_graph(prompt, answer)
-                    
                     st.markdown(f"**{answer}**")
-                    
-                    if fig:
-                        st.markdown(f"📊 Gráfico: {suggestion}")
-                        st.plotly_chart(fig, use_container_width=True, key=f"graph_{len(st.session_state.messages)}_{int(time.time())}")
-                    
-                    full_response = answer + ("\n\n📊 Gráfico adicionado!" if fig else "")
 
-                st.session_state.messages.append({"role": "assistant", "content": full_response, "fig": fig if fig else None})
+                    # Decide automaticamente se deve gerar gráfico
+                    should_plot = bool(re.search(r"gráfic|visualiza|plot|diagrama", answer.lower()) or
+                                       re.search(r"gráfic|visualiza|plot|diagrama", prompt.lower()))
+
+                    if should_plot:
+                        chart_type = choose_chart_type(st.session_state.agente.df, prompt)
+                        fig = st.session_state.agente.generate_graph(prompt, chart_type)
+                        if fig:
+                            st.markdown(f"📊 Gráfico gerado automaticamente: **{chart_type}**")
+                            st.plotly_chart(fig, use_container_width=True)
+                            full_response = answer + f"\n\n📊 Gráfico ({chart_type}) adicionado!"
+                        else:
+                            full_response = answer
+                    else:
+                        full_response = answer
+
+                st.session_state.messages.append({"role": "assistant", "content": full_response,
+                                                  "fig": fig if should_plot else None})
+
 
 if __name__ == "__main__":
     main()
