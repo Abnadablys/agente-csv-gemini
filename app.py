@@ -206,7 +206,7 @@ class AgenteGeminiCSV:
 # --------------------------------------------------------
 def main():
     st.set_page_config(page_title="Agente CSV com Gemini", layout="wide")
-    st.title("🚀 Agente Analista de CSV com Gemini 2.5 Flash")
+    st.title("🚀 Agente Analista de Dados CSV")
 
     with st.sidebar:
         st.header("📁 Upload CSV")
